@@ -11,8 +11,9 @@ app.get('/', (req, res) => {
     res.sendFile(path.join(__dirname, 'index.html'));
 });
 
-// Store active rooms
+// Store active rooms and the auto-match queue
 const activeRooms = {};
+let autoMatchQueue = null;
 
 io.on('connection', (socket) => {
     console.log('User connected:', socket.id);
@@ -20,7 +21,42 @@ io.on('connection', (socket) => {
     // Broadcast total online users to everyone
     io.emit('onlineCount', io.engine.clientsCount);
 
-    // Host creates a room
+    // --- AUTO MATCHMAKING ---
+    socket.on('findRandomMatch', (data) => {
+        const { player, boardSize } = data;
+        
+        if (autoMatchQueue && autoMatchQueue.socket.id !== socket.id) {
+            // We found a waiting player! Match them up.
+            const hostData = autoMatchQueue;
+            const guestData = { socket, player };
+            
+            // Generate a random room code for them
+            const roomCode = 'AUTO_' + Math.random().toString(36).substr(2,4).toUpperCase();
+            
+            hostData.socket.join(roomCode);
+            guestData.socket.join(roomCode);
+            
+            activeRooms[roomCode] = { host: hostData.player, guest: guestData.player, boardSize: hostData.boardSize };
+            
+            // Notify both players that a match was found
+            hostData.socket.emit('autoMatchFound', { role: 'host', roomCode, opponent: guestData.player, boardSize: hostData.boardSize });
+            guestData.socket.emit('autoMatchFound', { role: 'guest', roomCode, opponent: hostData.player, boardSize: hostData.boardSize });
+            
+            console.log(`Auto Match created: ${roomCode}`);
+            autoMatchQueue = null; // Clear the queue for the next people
+        } else {
+            // Nobody is waiting, put this player in the queue
+            autoMatchQueue = { socket, player, boardSize };
+        }
+    });
+
+    socket.on('cancelAutoMatch', () => {
+        if (autoMatchQueue && autoMatchQueue.socket.id === socket.id) {
+            autoMatchQueue = null;
+        }
+    });
+
+    // --- PRIVATE ROOMS ---
     socket.on('createRoom', (data) => {
         const { roomCode, player, boardSize } = data;
         socket.join(roomCode);
@@ -28,7 +64,6 @@ io.on('connection', (socket) => {
         console.log(`Room created: ${roomCode}`);
     });
 
-    // Guest joins a room
     socket.on('joinRoom', (data) => {
         const { roomCode, player } = data;
         const room = activeRooms[roomCode];
@@ -36,11 +71,7 @@ io.on('connection', (socket) => {
         if (room && !room.guest) {
             socket.join(roomCode);
             room.guest = player;
-            
-            // Tell the guest the join was successful and give them host data
             socket.emit('joinSuccess', { host: room.host, boardSize: room.boardSize });
-            
-            // Tell the host that the guest has arrived
             socket.to(roomCode).emit('guestJoined', { guest: player });
             console.log(`${player.name} joined room: ${roomCode}`);
         } else {
@@ -59,10 +90,15 @@ io.on('connection', (socket) => {
         delete activeRooms[data.roomCode];
     });
 
-    // Handle sudden disconnects (closing the tab)
+    // Handle sudden disconnects
     socket.on('disconnect', () => {
         console.log('User disconnected:', socket.id);
         io.emit('onlineCount', io.engine.clientsCount);
+
+        // Remove from auto queue if they close the app while waiting
+        if (autoMatchQueue && autoMatchQueue.socket.id === socket.id) {
+            autoMatchQueue = null;
+        }
 
         // Find if they were in a room and alert the other player
         for (const code in activeRooms) {
